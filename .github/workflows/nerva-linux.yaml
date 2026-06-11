@@ -1,0 +1,91 @@
+name: Build nerva libwallet (linux x86_64)
+
+# Builds the nerva_libwallet2_api_c wrapper .so for linux via Nerva's own
+# contrib/depends -- the SAME path as android/ios/macOS and as nerva-project's
+# depends.yml (host x86_64-unknown-linux-gnu uses plain `gcc -m64`, no
+# simplybs / from-source toolchain). depends statically links boost / openssl
+# / unbound / sodium, so the .so is self-contained (only libstdc++/libc
+# dynamic, matching cs_monero) -- unlike a system-boost build.
+#
+# Runs in an ubuntu:20.04 container so the lib links an old glibc and stays
+# portable to newer distros.
+
+on:
+  push:
+    branches: [nerva]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    timeout-minutes: 300
+    steps:
+      - name: Install host build tools (same set as nerva's depends.yml)
+        run: |
+          apt update
+          apt -y install build-essential libtool cmake autotools-dev automake \
+            pkg-config bsdmainutils curl git ca-certificates ccache gperf \
+            python3 unzip python-is-python3 file
+
+      - name: Configure git identity (apply_patches.sh makes commits)
+        run: |
+          git config --global user.email "monero_c@ci.local"
+          git config --global user.name "MoneroC CI"
+          git config --global --add safe.directory '*'
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply nerva patches
+        run: ./apply_patches.sh nerva
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-nerva-linux-${{ github.run_id }}
+          restore-keys: ccache-nerva-linux-
+
+      - name: Nerva depends cache (x86_64-unknown-linux-gnu)
+        uses: actions/cache@v4
+        with:
+          path: nerva/contrib/depends/built
+          key: nerva-depends-x86_64-unknown-linux-gnu-${{ hashFiles('nerva/contrib/depends/packages/*') }}
+          restore-keys: nerva-depends-x86_64-unknown-linux-gnu-
+
+      - name: Build nerva depends (x86_64-unknown-linux-gnu) — static boost/openssl/...
+        run: |
+          ccache --max-size=1G
+          make -C nerva/contrib/depends HOST=x86_64-unknown-linux-gnu -j"$(nproc)"
+
+      - name: Build wrapper .so (static, self-contained)
+        run: |
+          cd nerva_libwallet2_api_c
+          mkdir -p build/x86_64-unknown-linux-gnu
+          cd build/x86_64-unknown-linux-gnu
+          cmake \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/../../../nerva/contrib/depends/x86_64-unknown-linux-gnu/share/toolchain.cmake" \
+            -DMONERO_FLAVOR=nerva \
+            -DHOST_ABI=x86_64-unknown-linux-gnu \
+            -DOUTPUT_MODE=SHARED \
+            -DCMAKE_BUILD_TYPE=Release \
+            ../..
+          make -j"$(nproc)" nerva_wallet2_api_c
+
+      - name: Locate built .so
+        if: always()
+        run: find nerva_libwallet2_api_c/build -name '*.so' | tee found.txt
+
+      - name: Upload .so
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nerva-linux-x86_64-so
+          path: nerva_libwallet2_api_c/build/**/*.so
+          if-no-files-found: warn

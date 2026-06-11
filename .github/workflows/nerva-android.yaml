@@ -1,0 +1,118 @@
+name: Build nerva libwallet (android)
+
+# Cross-compiles the nerva_libwallet2_api_c wrapper .so for Android ABIs.
+#
+# Mirrors nerva-project/nerva's own ci/gh-actions/depends.yml: apt host
+# tools + Nerva's contrib/depends (which auto-fetches the Android NDK via
+# packages/android_ndk.mk), NOT monero_c's from-source simplybs toolchain.
+# The wrapper's CMake add_subdirectory(../nerva) builds Nerva's wallet2_api
+# under the depends toolchain file, so the .so links against the same cross
+# libs Nerva itself ships. ANDROID_API=21 (hosts/android.mk).
+
+on:
+  push:
+    branches: [nerva]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: aarch64-linux-android      # real phones (nerva-tested target)
+            abi: arm64-v8a
+          - host: arm-linux-androideabi       # older 32-bit phones
+            abi: armeabi-v7a
+          # NB: x86_64-linux-android is intentionally omitted -- nerva's
+          # android_ndk.mk only sets --arch for arm/arm64 (matching nerva's
+          # own depends.yml, which builds aarch64 android only).
+    name: ${{ matrix.abi }}
+    steps:
+      - name: Install dependencies (same set as nerva's depends.yml)
+        run: |
+          apt update
+          apt -y install build-essential libtool cmake autotools-dev automake \
+            pkg-config bsdmainutils curl git ca-certificates ccache gperf \
+            python3 unzip python-is-python3 file
+
+      - name: Configure git identity (apply_patches.sh makes commits)
+        run: |
+          git config --global user.email "monero_c@ci.local"
+          git config --global user.name "MoneroC CI"
+          git config --global --add safe.directory '*'
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply nerva patches
+        run: ./apply_patches.sh nerva
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-nerva-${{ matrix.host }}-${{ github.run_id }}
+          restore-keys: ccache-nerva-${{ matrix.host }}-
+
+      - name: Nerva depends cache (${{ matrix.host }})
+        uses: actions/cache@v4
+        with:
+          path: nerva/contrib/depends/built
+          key: nerva-depends-${{ matrix.host }}-${{ hashFiles('nerva/contrib/depends/packages/*') }}
+          restore-keys: nerva-depends-${{ matrix.host }}-
+
+      - name: Build nerva depends (${{ matrix.host }}) — NDK + boost/openssl/...
+        run: |
+          ccache --max-size=1G
+          make -C nerva/contrib/depends HOST=${{ matrix.host }} -j"$(nproc)"
+
+      - name: Build wrapper .so (${{ matrix.host }})
+        run: |
+          DEPROOT="$PWD/nerva/contrib/depends/${{ matrix.host }}"
+          echo "=== libc++ libraries in the r18b standalone toolchain ==="
+          find "$DEPROOT" -name 'libc++*' 2>/dev/null || true
+          # The wrapper forces -stdlib=libc++ -static-libstdc++, so the link
+          # emits -lc++. NDK r18b's standalone toolchain puts libc++ in an
+          # arch lib dir (lib64 for arm64) the gcc-4.9 ld doesn't search by
+          # default -- add it explicitly so -lc++ resolves.
+          CXXLIBDIR="$(dirname "$(find "$DEPROOT" -name 'libc++_static.a' | head -1)")"
+          echo "c++ runtime lib dir: $CXXLIBDIR"
+          # r18b's standalone toolchain ships libc++_static.a / libc++abi.a but
+          # no plain libc++.{a,so}, so the wrapper's -stdlib=libc++ (which emits
+          # -lc++) can't resolve. Drop a libc++.a linker script that pulls the
+          # static c++ runtime + abi in the right group order: self-contained,
+          # no runtime libc++_shared.so dependency (matches monero/wownero libs).
+          printf 'INPUT(libc++_static.a libc++abi.a)\n' > "$CXXLIBDIR/libc++.a"
+          cd nerva_libwallet2_api_c
+          mkdir -p build/${{ matrix.host }}
+          cd build/${{ matrix.host }}
+          cmake \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/../../../nerva/contrib/depends/${{ matrix.host }}/share/toolchain.cmake" \
+            -DMONERO_FLAVOR=nerva \
+            -DHOST_ABI=${{ matrix.host }} \
+            -DOUTPUT_MODE=SHARED \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L$CXXLIBDIR" \
+            ../..
+          make -j"$(nproc)" nerva_wallet2_api_c
+
+      - name: Locate built .so
+        if: always()
+        run: find nerva_libwallet2_api_c/build -name '*.so' | tee found.txt
+
+      - name: Upload .so
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nerva-android-${{ matrix.abi }}-so
+          path: nerva_libwallet2_api_c/build/**/*.so
+          if-no-files-found: warn

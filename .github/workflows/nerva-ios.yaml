@@ -1,0 +1,106 @@
+name: "Build nerva wrapper (ios, Xcode-native compile check)"
+
+# Cross-compiles the nerva_libwallet2_api_c wrapper for iOS (arm64-apple-ios)
+# on a macOS runner, using the runner's OWN Xcode (clang + iPhoneOS SDK +
+# system cctools) -- NO monero_c/simplybs, NO hermetic from-source toolchain,
+# NO Xcode download.
+#
+# Deps (boost/openssl/unbound/...) are cross-built for the iOS arch via
+# Nerva's own contrib/depends with the new apple-ios host (patches/nerva/0003
+# -> hosts/ios.mk). That's the one unavoidable from-source bit for iOS -- the
+# libraries themselves (no prebuilt iOS boost exists for Monero's needs) --
+# but built with the native Xcode clang, not a built toolchain.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: aarch64-apple-ios
+            artifact: nerva-ios-arm64
+    name: ${{ matrix.host }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install build deps (brew) — host build tools only
+        run: |
+          brew install autoconf automake libtool pkg-config gperf ccache coreutils
+
+      # The runner ships CMake 4.x, which removed the legacy FindBoost module that
+      # Nerva/Monero's CMake relies on (it sets Boost_NO_BOOST_CMAKE ON). Pin a
+      # 3.29.x so iOS uses MODULE mode like the green linux/android builds.
+      - name: Pin CMake 3.29 (FindBoost MODULE mode)
+        run: |
+          CMAKE_VER=3.29.6
+          curl -fsSL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-macos-universal.tar.gz" -o /tmp/cmake.tar.gz
+          tar -xzf /tmp/cmake.tar.gz -C /tmp
+          echo "/tmp/cmake-${CMAKE_VER}-macos-universal/CMake.app/Contents/bin" >> "$GITHUB_PATH"
+
+      - name: Verify cmake version
+        run: cmake --version
+
+      - name: Configure git identity (apply_patches.sh makes commits)
+        run: |
+          git config --global user.email "monero_c@ci.local"
+          git config --global user.name "MoneroC CI"
+          git config --global --add safe.directory '*'
+
+      - name: Apply nerva patches (incl. 0003 apple-ios depends host)
+        run: ./apply_patches.sh nerva
+
+      - name: Nerva depends cache (aarch64-apple-ios)
+        uses: actions/cache@v4
+        with:
+          path: nerva/contrib/depends/built
+          key: nerva-depends-ios-${{ hashFiles('nerva/contrib/depends/packages/*') }}
+          restore-keys: nerva-depends-ios-
+          save-always: true
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-nerva-ios-${{ github.run_id }}
+          restore-keys: ccache-nerva-ios-
+          save-always: true
+
+      - name: Build nerva depends (aarch64-apple-ios) — native Xcode clang + iPhoneOS SDK
+        run: |
+          ccache --max-size=1G
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-path)"
+          make -C nerva/contrib/depends HOST=aarch64-apple-ios -j"$(sysctl -n hw.logicalcpu)"
+
+      - name: Build wrapper (aarch64-apple-ios)
+        run: |
+          cd nerva_libwallet2_api_c
+          mkdir -p build/aarch64-apple-ios
+          cd build/aarch64-apple-ios
+          cmake \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/../../../nerva/contrib/depends/aarch64-apple-ios/share/toolchain.cmake" \
+            -DMONERO_FLAVOR=nerva \
+            -DHOST_ABI=aarch64-apple-ios \
+            -DOUTPUT_MODE=SHARED \
+            -DCMAKE_BUILD_TYPE=Release \
+            ../..
+          make -j"$(sysctl -n hw.logicalcpu)" nerva_wallet2_api_c
+
+      - name: Locate built lib
+        if: always()
+        run: find nerva_libwallet2_api_c/build -name 'lib*wallet2_api_c.*' | tee found.txt
+
+      - name: Upload lib
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: nerva_libwallet2_api_c/build/**/lib*wallet2_api_c.*
+          if-no-files-found: warn

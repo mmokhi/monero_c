@@ -1,0 +1,80 @@
+name: "Build nerva libwallet (macos)"
+
+# Builds the nerva_libwallet2_api_c wrapper for macOS the way Nerva itself
+# does (build.yml `build-macos`): NATIVELY on a macOS runner with the
+# runner's own Xcode (clang) + brew-installed deps, then a direct cmake of
+# the wrapper -- exactly like our nerva-linux.yaml. No monero_c/simplybs,
+# no hermetic from-source toolchain, no Xcode download.
+#
+# iOS is handled separately (it needs its deps cross-built for the arm64-ios
+# arch, which brew can't provide) -- but still on a macOS runner with the
+# native Xcode, no simplybs.
+
+on:
+  push:
+    branches: [nerva]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: aarch64-apple-darwin
+            artifact: nerva-macos-arm64
+    name: ${{ matrix.host }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install deps (brew) — same spirit as nerva's build-macos
+        run: |
+          brew install boost unbound zmq libsodium openssl@3 hidapi ccache pkg-config cmake
+
+      - name: Configure git identity (apply_patches.sh makes commits)
+        run: |
+          git config --global user.email "monero_c@ci.local"
+          git config --global user.name "MoneroC CI"
+          git config --global --add safe.directory '*'
+
+      - name: Apply nerva patches
+        run: ./apply_patches.sh nerva
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-nerva-macos-${{ github.run_id }}
+          restore-keys: ccache-nerva-macos-
+
+      - name: Build wrapper (native Xcode + brew deps, no depends/simplybs)
+        run: |
+          export OPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+          export CMAKE_PREFIX_PATH="$(brew --prefix):$(brew --prefix openssl@3):$(brew --prefix boost)"
+          cd nerva_libwallet2_api_c
+          mkdir -p build && cd build
+          cmake .. \
+            -DMONERO_FLAVOR=nerva \
+            -DOUTPUT_MODE=SHARED \
+            -DHOST_ABI=${{ matrix.host }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          make -j"$(sysctl -n hw.logicalcpu)" nerva_wallet2_api_c
+
+      - name: Locate built lib
+        if: always()
+        run: find . -name 'lib*wallet2_api_c*.dylib' -o -name 'lib*wallet2_api_c*.so' | tee found.txt
+
+      - name: Upload lib
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: nerva_libwallet2_api_c/build/**/lib*wallet2_api_c.*
+          if-no-files-found: warn
